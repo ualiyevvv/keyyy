@@ -1,0 +1,176 @@
+---
+# Русская раскладка на студенческих машинах.
+#
+# Использование (из каталога ansible/):
+#   ansible-playbook playbooks/keyboard_ru.yml
+#   ansible-playbook playbooks/keyboard_ru.yml --limit group_b
+#   ansible-playbook playbooks/keyboard_ru.yml -e switch=win_space   # другой хоткей
+#   ansible-playbook playbooks/keyboard_ru.yml -e action=remove      # откатить
+#
+# После прогона нужен reboot: настройка ложится в persistent-слой, а в текущей
+# сессии применяется отдельно — но надёжнее перезайти.
+#
+#   ansible-playbook playbooks/keyboard_ru.yml
+#   ansible-playbook playbooks/reboot.yml
+#
+# ─── ПОЧЕМУ ДВЕ НАСТРОЙКИ ПЕРЕКЛЮЧЕНИЯ, А НЕ ОДНА ────────────────────────────
+# Машины идут на Wayland (см. gdm3/custom.conf). На Wayland GNOME управляет
+# раскладками сам, и xkb-опция grp:alt_shift_toggle не работает — она уровня
+# X11. Поэтому задаём обе:
+#   xkb-options            → консоль, XWayland, экран входа
+#   switch-input-source    → сам GNOME на Wayland
+# Одной из них мало: раскладка появится в списке, а хоткей молча не сработает.
+# Это ровно тот класс полутихих отказов, на которых мы уже обжигались с
+# wmctrl и xdotool.
+#
+# ─── ПОЧЕМУ СИСТЕМНЫЙ dconf, А НЕ НАСТРОЙКА ПОЛЬЗОВАТЕЛЯ ─────────────────────
+# configure.sh при зачистке удаляет пользовательский dconf, и каждый студент
+# получает профиль с нуля. Настройка в ~/.config переживёт ровно одну сессию.
+# Системная база /etc/dconf/db/local.d применяется к ЛЮБОМУ профилю, включая
+# свежесозданный, и лежит в /etc — то есть в lowerdir.
+
+- name: Русская раскладка
+  hosts: students
+  gather_facts: false
+
+  vars:
+    action: add            # add | remove
+    switch: alt_shift      # alt_shift | win_space | caps
+
+    _xkb_opt:
+      alt_shift: "grp:alt_shift_toggle"
+      win_space: "grp:win_space_toggle"
+      caps: "grp:caps_toggle"
+    _gnome_key:
+      alt_shift: "['<Alt>Shift_L']"
+      win_space: "['<Super>space']"
+      caps: "['Caps_Lock']"
+    _gnome_key_back:
+      alt_shift: "['<Shift>Alt_L']"
+      win_space: "['<Shift><Super>space']"
+      caps: "['<Shift>Caps_Lock']"
+
+  tasks:
+    - name: Проверить, что хоткей известен
+      ansible.builtin.fail:
+        msg: "switch='{{ switch }}' — допустимо: alt_shift, win_space, caps"
+      when: switch not in _xkb_opt
+
+    - name: Определить, активен ли overlayroot
+      ansible.builtin.shell: |
+        if findmnt -no FSTYPE / | grep -q overlay && command -v overlayroot-chroot >/dev/null; then
+          echo yes
+        else
+          echo no
+        fi
+      register: ovl
+      changed_when: false
+
+    # ── Подготовка файлов ────────────────────────────────────────────────────
+    - name: Собрать dconf-настройку
+      ansible.builtin.copy:
+        dest: /tmp/03-keyboard
+        mode: "0644"
+        content: |
+          # Русская раскладка — добавлено плейбуком keyboard_ru.yml
+          # Файл 03-* идёт после 01-z01 (dconfig.txt) и 02-wallpaper.
+          [org/gnome/desktop/input-sources]
+          sources=[('xkb', 'us'), ('xkb', 'ru')]
+          xkb-options=['{{ _xkb_opt[switch] }}']
+          per-window=false
+
+          # Wayland: GNOME переключает раскладки сам, xkb-опция выше его не касается
+          [org/gnome/desktop/wm/keybindings]
+          switch-input-source={{ _gnome_key[switch] }}
+          switch-input-source-backward={{ _gnome_key_back[switch] }}
+      when: action == "add"
+
+    - name: Собрать /etc/default/keyboard
+      # Отвечает за консоль, XWayland и экран входа GDM.
+      ansible.builtin.copy:
+        dest: /tmp/keyboard-default
+        mode: "0644"
+        content: |
+          XKBMODEL="pc105"
+          XKBLAYOUT="us,ru"
+          XKBVARIANT=""
+          XKBOPTIONS="{{ _xkb_opt[switch] }}"
+          BACKSPACE="guess"
+      when: action == "add"
+
+    # ── Применить: persistent ────────────────────────────────────────────────
+    - name: Записать в persistent-слой
+      # Через stdin, а не heredoc внутри chroot: вложенные кавычки в такой
+      # конструкции ломаются легко и незаметно.
+      ansible.builtin.shell: |
+        overlayroot-chroot install -d -m 755 /etc/dconf/db/local.d
+        overlayroot-chroot sh -c 'cat > /etc/dconf/db/local.d/03-keyboard' < /tmp/03-keyboard
+        overlayroot-chroot sh -c 'cat > /etc/default/keyboard' < /tmp/keyboard-default
+        overlayroot-chroot dconf update
+      when:
+        - action == "add"
+        - ovl.stdout | trim == "yes"
+      changed_when: true
+
+    - name: Записать напрямую (машина без overlayroot)
+      ansible.builtin.shell: |
+        install -d -m 755 /etc/dconf/db/local.d
+        cp -f /tmp/03-keyboard /etc/dconf/db/local.d/03-keyboard
+        cp -f /tmp/keyboard-default /etc/default/keyboard
+        dconf update
+      when:
+        - action == "add"
+        - ovl.stdout | trim != "yes"
+      changed_when: true
+
+    # ── Применить: live, чтобы не ждать перезагрузки ─────────────────────────
+    - name: Применить в текущей сессии
+      ansible.builtin.shell: |
+        install -d -m 755 /etc/dconf/db/local.d
+        cp -f /tmp/03-keyboard /etc/dconf/db/local.d/03-keyboard
+        cp -f /tmp/keyboard-default /etc/default/keyboard
+        dconf update
+        setupcon --save-only 2>/dev/null || true
+        # Толкнуть уже запущенную сессию: gsettings пишется от имени student,
+        # иначе gnome-shell подхватит новое только при следующем входе.
+        uid=$(id -u student 2>/dev/null) || exit 0
+        XRD="/run/user/$uid"
+        [ -d "$XRD" ] || exit 0
+        sudo -u student env XDG_RUNTIME_DIR="$XRD" \
+          DBUS_SESSION_BUS_ADDRESS="unix:path=$XRD/bus" \
+          gsettings set org.gnome.desktop.input-sources sources \
+          "[('xkb', 'us'), ('xkb', 'ru')]" 2>/dev/null || true
+      when: action == "add"
+      changed_when: true
+      failed_when: false
+
+    # ── Откат ────────────────────────────────────────────────────────────────
+    - name: Убрать русскую раскладку
+      ansible.builtin.shell: |
+        rm -f /etc/dconf/db/local.d/03-keyboard
+        dconf update 2>/dev/null || true
+        if findmnt -no FSTYPE / | grep -q overlay && command -v overlayroot-chroot >/dev/null; then
+          overlayroot-chroot rm -f /etc/dconf/db/local.d/03-keyboard
+          overlayroot-chroot dconf update
+        fi
+      when: action == "remove"
+      changed_when: true
+
+    # ── Проверка ─────────────────────────────────────────────────────────────
+    - name: Проверить persistent-слой
+      ansible.builtin.shell: |
+        if findmnt -no FSTYPE / | grep -q overlay && command -v overlayroot-chroot >/dev/null; then
+          run() { overlayroot-chroot "$@"; }; where=persistent
+        else
+          run() { "$@"; }; where=live
+        fi
+        src=нет; kbd=нет
+        run grep -q "xkb', 'ru'" /etc/dconf/db/local.d/03-keyboard 2>/dev/null && src=есть
+        run grep -q 'XKBLAYOUT="us,ru"' /etc/default/keyboard 2>/dev/null && kbd=есть
+        echo "$where | dconf: $src | /etc/default/keyboard: $kbd"
+      register: check
+      changed_when: false
+
+    - name: Результат
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ check.stdout | trim }}"
