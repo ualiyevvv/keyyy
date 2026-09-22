@@ -1,0 +1,75 @@
+---
+# Симуляция нажатия пробела на студенческих машинах.
+#
+# Использование (из каталога ansible/):
+#   ansible-playbook playbooks/keyboard_press.yml
+#   ansible-playbook playbooks/keyboard_press.yml --limit group_b
+#   ansible-playbook playbooks/keyboard_press.yml -e times=5          # 5 раз
+#   ansible-playbook playbooks/keyboard_press.yml -e delay_ms=100     # медленнее
+#
+# ─── ПОЧЕМУ ydotool, А НЕ xdotool ─────────────────────────────────────────
+# Машины на Wayland (см. keyboard_ru.yml). xdotool работает на уровне X11/
+# оконного менеджера и на чистом Wayland ввод не симулирует — либо молчит,
+# либо требует XWayland-костылей. ydotool работает через /dev/uinput —
+# это уровень ядра, ниже и X11, и Wayland, поэтому нажатие долетает
+# в любую сессию независимо от композитора.
+#
+# ─── ПОЧЕМУ "type", А НЕ "key" ─────────────────────────────────────────────
+# ydotool key принимает evdev-коды клавиш (например, 57 — это пробел),
+# что легко перепутать и молча получить не ту клавишу. Для пробела проще
+# и надёжнее отправить его как обычный символ через `ydotool type " "` —
+# то же самое физическое нажатие пробела, без риска ошибиться в коде.
+
+- name: Симуляция нажатия пробела
+  hosts: students
+  become: true
+  gather_facts: false
+
+  vars:
+    times: 1        # сколько раз "нажать" пробел
+    delay_ms: 50     # пауза между нажатиями, мс
+    socket_path: /run/ydotoold.socket
+
+  tasks:
+    - name: Установить ydotool
+      ansible.builtin.apt:
+        name: ydotool
+        state: present
+        update_cache: true
+
+    - name: Загрузить модуль uinput
+      ansible.builtin.shell: modprobe uinput
+      changed_when: false
+
+    - name: Обеспечить автозагрузку uinput после перезагрузки
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/uinput.conf
+        content: "uinput\n"
+        mode: "0644"
+
+    - name: Проверить, запущен ли ydotoold
+      ansible.builtin.shell: pgrep -x ydotoold
+      register: ydotoold_running
+      changed_when: false
+      failed_when: false
+
+    - name: Запустить ydotoold в фоне, если не запущен
+      ansible.builtin.shell: |
+        nohup ydotoold --socket-path={{ socket_path }} \
+          > /var/log/ydotoold.log 2>&1 &
+        disown
+        sleep 1
+      when: ydotoold_running.rc != 0
+      changed_when: true
+
+    - name: Прожать пробел {{ times }} раз(а)
+      ansible.builtin.shell: |
+        export YDOTOOL_SOCKET={{ socket_path }}
+        for i in $(seq 1 {{ times }}); do
+          ydotool type -d {{ delay_ms }} " "
+        done
+      changed_when: true
+
+    - name: Результат
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: пробел отправлен {{ times }} раз(а)"
