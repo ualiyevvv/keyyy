@@ -1,0 +1,54 @@
+---
+# Установка OBS Studio на конкретный компьютер (Ubuntu/Debian)
+#
+# Использование:
+#   # Один компьютер (имя как в inventory)
+#   ansible-playbook playbooks/install_obs.yml -e "target=pc01"
+#
+#   # Несколько компьютеров
+#   ansible-playbook playbooks/install_obs.yml -e "target=pc01,pc02"
+#
+#   # Свежая версия из официального PPA OBS вместо версии из репозитория Ubuntu
+#   ansible-playbook playbooks/install_obs.yml -e "target=pc01 use_ppa=true"
+#
+# Если система live — после ребута OBS пропадёт.
+
+- name: Install OBS Studio
+  hosts: "{{ target | default('') }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    use_ppa: false
+
+  tasks:
+    - name: Fail if target is not set
+      ansible.builtin.fail:
+        msg: "Укажите компьютер: -e target=pc01"
+      when: target is not defined or target == ""
+      run_once: true
+
+    - name: Add OBS PPA (optional)
+      ansible.builtin.apt_repository:
+        repo: ppa:obsproject/obs-studio
+        state: present
+      when: use_ppa | bool
+
+    - name: Install OBS Studio and ffmpeg
+      ansible.builtin.apt:
+        name:
+          - obs-studio
+          - ffmpeg
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Check installed OBS version
+      ansible.builtin.command: obs --version
+      register: obs_version
+      changed_when: false
+      failed_when: false
+
+    - name: Show OBS version
+      ansible.builtin.debug:
+        msg: "{{ obs_version.stdout | default('версия не определена') }}"
