@@ -1,0 +1,35 @@
+---
+# Только автологин: компьютер загружается сразу на рабочий стол, браузер не запускается
+# Все изменения LIVE-ONLY — ребут возвращает компьютер к обычному экрану логина
+#
+# Использование:
+#   ansible-playbook playbooks/autologin.yml
+
+- name: Auto-login to desktop (live only)
+  hosts: students
+  gather_facts: false
+
+  tasks:
+    - name: Check if student is already logged in
+      ansible.builtin.shell: pgrep -u student gnome-session
+      register: student_session
+      failed_when: false
+      changed_when: false
+
+    - name: Skip — student already logged in
+      ansible.builtin.debug:
+        msg: "Student already logged in, skipping"
+      when: student_session.rc == 0
+
+    - name: Set GDM auto-login
+      ansible.builtin.shell: |
+        sed -i '/^AutomaticLoginEnable/d; /^AutomaticLogin=/d' /etc/gdm3/custom.conf
+        sed -i '/^\[daemon\]/a AutomaticLoginEnable=true\nAutomaticLogin=student' /etc/gdm3/custom.conf
+      when: student_session.rc != 0
+
+    - name: Restart GDM to apply auto-login
+      ansible.builtin.shell: sleep 1 && systemctl restart gdm3 &
+      async: 1
+      poll: 0
+      ignore_errors: true
+      when: student_session.rc != 0
