@@ -1,0 +1,39 @@
+---
+# Установка OBS Studio (persistent через overlayroot-chroot)
+#
+# Использование:
+#   # Установить OBS на конкретный компьютер
+#   ansible-playbook playbooks/install_obs.yml -e "target=pc01"
+#
+#   # Удалить OBS
+#   ansible-playbook playbooks/install_obs.yml -e "target=pc01" -e "action=remove"
+#
+# Ставится из репозитория Ubuntu (apt). Если нужна свежая версия — скажите,
+# добавлю установку из официального PPA obsproject/obs-studio.
+
+- name: Install OBS Studio (persistent)
+  hosts: "{{ target | default('') }}"
+  gather_facts: false
+
+  vars:
+    action: install
+
+  tasks:
+    - name: Fail if target is not set
+      ansible.builtin.fail:
+        msg: "Укажите компьютер: -e target=pc01"
+      when: target is not defined or target == ""
+      run_once: true
+
+    - name: Install OBS Studio
+      ansible.builtin.shell: |
+        overlayroot-chroot bash -c '
+          apt-get update -qq
+          apt-get install -y obs-studio ffmpeg
+        '
+      when: action == "install"
+
+    - name: Remove OBS Studio
+      ansible.builtin.shell: |
+        overlayroot-chroot bash -c 'apt-get -y purge obs-studio'
+      when: action == "remove"
