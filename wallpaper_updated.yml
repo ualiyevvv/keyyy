@@ -1,0 +1,164 @@
+---
+# Смена обоев рабочего стола и/или экрана блокировки
+# Persistent через overlayroot-chroot
+#
+# Использование:
+#   # Сменить обои (файл с админ машины):
+#   ansible-playbook playbooks/wallpaper.yml -e "src=../files/new_wallpaper.png"
+#
+#   # Сменить обои по URL:
+#   ansible-playbook playbooks/wallpaper.yml -e "url=https://example.com/wallpaper.png"
+#
+#   # Сменить только lock screen:
+#   ansible-playbook playbooks/wallpaper.yml -e "src=../files/lock.png" -e "target=lock"
+#
+#   # Сменить только desktop:
+#   ansible-playbook playbooks/wallpaper.yml -e "src=../files/desk.png" -e "target=desktop"
+#
+# ВАЖНО: persistent-раздел (то, во что пишет overlayroot-chroot) обычно
+# небольшой. Файл копируется в 2 места (desktop + gdm), поэтому нужно
+# минимум 2x его размера свободного места. Если места не хватит — задача
+# теперь падает с ошибкой явно, а не молча "успешно" применяется только
+# до ближайшего ребута.
+
+- name: Change wallpaper
+  hosts: students
+  gather_facts: false
+
+  vars:
+    src: ""
+    url: ""
+    target: both    # both | desktop | lock
+    max_size_mb: 15 # разумный потолок для обоев; выше — предупреждение
+
+  tasks:
+    - name: Copy wallpaper from admin machine
+      ansible.builtin.copy:
+        src: "{{ src }}"
+        dest: /tmp/new_wallpaper.png
+        mode: '0644'
+      when: src != ""
+
+    - name: Download wallpaper from URL
+      ansible.builtin.get_url:
+        url: "{{ url }}"
+        dest: /tmp/new_wallpaper.png
+        mode: '0644'
+      when: url != "" and src == ""
+
+    - name: Get wallpaper file size
+      ansible.builtin.stat:
+        path: /tmp/new_wallpaper.png
+      register: wp_stat
+
+    - name: Warn if wallpaper is unusually large
+      ansible.builtin.debug:
+        msg: >-
+          ВНИМАНИЕ: файл {{ (wp_stat.stat.size / 1024 / 1024) | round(1) }} МБ,
+          это больше {{ max_size_mb }} МБ. Persistent-раздел может не вместить
+          копию (или две копии, если target=both). Рекомендуется сжать
+          изображение перед отправкой.
+      when: wp_stat.stat.size > (max_size_mb * 1024 * 1024)
+
+    - name: Check free space on persistent storage
+      ansible.builtin.shell: |
+        overlayroot-chroot bash -c 'df -Pk /usr/share/backgrounds | tail -1'
+      register: free_space
+      changed_when: false
+
+    - name: Fail early if not enough free space
+      ansible.builtin.fail:
+        msg: >-
+          Недостаточно места на persistent-разделе: доступно
+          {{ (free_space.stdout.split() [3] | int / 1024) | round(1) }} МБ,
+          а нужно как минимум {{ ((wp_stat.stat.size / 1024 / 1024) *
+          (2 if target == 'both' else 1)) | round(1) }} МБ.
+      when: >
+        (free_space.stdout.split()[3] | int * 1024) <
+        (wp_stat.stat.size * (2 if target == 'both' else 1))
+
+    - name: Apply desktop wallpaper (persistent)
+      ansible.builtin.shell: |
+        set -e
+        overlayroot-chroot bash -c '
+          set -e
+          cp /tmp/new_wallpaper.png /usr/share/backgrounds/01/wallpaper.png
+          chmod 644 /usr/share/backgrounds/01/wallpaper.png
+        '
+      when: target == "both" or target == "desktop"
+
+    - name: Apply live (non-persistent) copy for immediate effect
+      ansible.builtin.copy:
+        src: /tmp/new_wallpaper.png
+        dest: /usr/share/backgrounds/01/wallpaper.png
+        remote_src: true
+        mode: '0644'
+      failed_when: false
+      when: target == "both" or target == "desktop"
+
+    - name: Apply lock/login screen wallpaper (persistent)
+      ansible.builtin.shell: |
+        set -e
+        overlayroot-chroot bash -c '
+          set -e
+          cp /tmp/new_wallpaper.png /usr/share/backgrounds/gdm/gdm-wallpaper
+          chmod 644 /usr/share/backgrounds/gdm/gdm-wallpaper
+        '
+      when: target == "both" or target == "lock"
+
+    - name: Apply live (non-persistent) lock copy for immediate effect
+      ansible.builtin.copy:
+        src: /tmp/new_wallpaper.png
+        dest: /usr/share/backgrounds/gdm/gdm-wallpaper
+        remote_src: true
+        mode: '0644'
+      failed_when: false
+      when: target == "both" or target == "lock"
+
+    - name: Update dconf for desktop wallpaper (persistent)
+      ansible.builtin.shell: |
+        set -e
+        overlayroot-chroot bash -c '
+          cat > /etc/dconf/db/local.d/02-wallpaper << EOF2
+        [org/gnome/desktop/background]
+        picture-uri='"'"'file:///usr/share/backgrounds/01/wallpaper.png'"'"'
+        picture-uri-dark='"'"'file:///usr/share/backgrounds/01/wallpaper.png'"'"'
+        picture-options='"'"'zoom'"'"'
+
+        [org/gnome/desktop/screensaver]
+        picture-uri='"'"'file:///usr/share/backgrounds/01/wallpaper.png'"'"'
+        lock-enabled=false
+        EOF2
+          dconf update
+        '
+      when: target == "both" or target == "desktop"
+
+    - name: Verify persistent copy actually landed (checksum check)
+      ansible.builtin.shell: |
+        overlayroot-chroot bash -c 'sha256sum /usr/share/backgrounds/01/wallpaper.png 2>/dev/null | cut -d" " -f1'
+      register: persisted_checksum
+      changed_when: false
+      failed_when: false
+      when: target == "both" or target == "desktop"
+
+    - name: Get source checksum
+      ansible.builtin.stat:
+        path: /tmp/new_wallpaper.png
+        checksum_algorithm: sha256
+      register: source_stat
+      when: target == "both" or target == "desktop"
+
+    - name: Fail if persistent write did not actually match source
+      ansible.builtin.fail:
+        msg: >-
+          Persistent-копия обоев не совпадает с исходным файлом (или не создалась).
+          Обои применились только временно и слетят после ребута. Проверьте
+          свободное место на persistent-разделе.
+      when: >-
+        (target == "both" or target == "desktop") and
+        (persisted_checksum.stdout | trim) != source_stat.stat.checksum
+
+    - name: Cleanup temp file
+      ansible.builtin.file:
+        path: /tmp/new_wallpaper.png
+        state: absent
