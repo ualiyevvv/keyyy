@@ -1,0 +1,1 @@
+ansible pc01 -m shell -a "overlayroot-chroot bash -c 'df -h; echo ---; du -sh /var/cache/apt/archives 2>/dev/null'"
