@@ -1,0 +1,94 @@
+---
+# Автологин + открытие сайта в Google Chrome в ОБЫЧНОМ окне (не fullscreen, не kiosk)
+# Все изменения LIVE-ONLY — ребут возвращает компьютер к обычному экрану логина
+#
+# Использование:
+#   # Автологин + Chrome с ссылкой (ребут сбросит)
+#   ansible-playbook playbooks/open_browser.yml
+#   ansible-playbook playbooks/open_browser.yml -e "url=https://google.com"
+#
+#   # Просто открыть Chrome у уже залогиненных
+#   ansible-playbook playbooks/open_browser.yml -e "action=open"
+
+- name: Auto-login + Chrome normal window (live only)
+  hosts: students
+  gather_facts: false
+
+  vars:
+    action: enable
+    url: "https://01.tomorrow-school.ai"
+    chrome_bin: google-chrome   # если у вас google-chrome-stable / chromium — поменяйте здесь
+
+  tasks:
+    # ═══════════════════════════════════════════════════
+    #  ENABLE: автологин + автозапуск браузера (live)
+    # ═══════════════════════════════════════════════════
+    - name: Check if student is already logged in
+      ansible.builtin.shell: pgrep -u student gnome-session
+      register: student_session
+      failed_when: false
+      changed_when: false
+      when: action == "enable"
+
+    - name: Skip — student already logged in
+      ansible.builtin.debug:
+        msg: "Student already logged in, skipping"
+      when: action == "enable" and student_session.rc == 0
+
+    - name: Create open-browser script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/open-browser
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          sleep 4
+          setsid nohup {{ chrome_bin }} --no-first-run --no-default-browser-check "{{ url }}" >/tmp/open-browser.log 2>&1 &
+      when: action == "enable" and student_session.rc != 0
+
+    - name: Create autostart entry
+      ansible.builtin.copy:
+        dest: /etc/xdg/autostart/open-browser.desktop
+        mode: "0644"
+        content: |
+          [Desktop Entry]
+          Type=Application
+          Name=Open Browser
+          Exec=/usr/local/bin/open-browser
+          X-GNOME-Autostart-enabled=true
+          NoDisplay=true
+      when: action == "enable" and student_session.rc != 0
+
+    - name: Set GDM auto-login
+      ansible.builtin.shell: |
+        sed -i '/^AutomaticLoginEnable/d; /^AutomaticLogin=/d' /etc/gdm3/custom.conf
+        sed -i '/^\[daemon\]/a AutomaticLoginEnable=true\nAutomaticLogin=student' /etc/gdm3/custom.conf
+      when: action == "enable" and student_session.rc != 0
+
+    - name: Restart GDM to apply auto-login
+      ansible.builtin.shell: sleep 1 && systemctl restart gdm3 &
+      async: 1
+      poll: 0
+      ignore_errors: true
+      when: action == "enable" and student_session.rc != 0
+
+    # ═══════════════════════════════════════════════════
+    #  OPEN: просто открыть браузер (без автологина)
+    # ═══════════════════════════════════════════════════
+    - name: Launch Chrome in current session
+      ansible.builtin.shell: |
+        pid=$(pgrep -u student gnome-session 2>/dev/null | head -1)
+        [[ -z "$pid" ]] && { echo "SKIP: student не залогинен"; exit 0; }
+
+        get_env() { tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep "^$1=" | head -1 | cut -d= -f2-; }
+        DISP=$(get_env DISPLAY)
+        XAUTH=$(get_env XAUTHORITY)
+        DBUS=$(get_env DBUS_SESSION_BUS_ADDRESS)
+        [[ -z "$DISP" ]] && { echo "SKIP: DISPLAY не найден"; exit 0; }
+
+        sudo -u student env DISPLAY="$DISP" XAUTHORITY="$XAUTH" DBUS_SESSION_BUS_ADDRESS="$DBUS" \
+          setsid nohup {{ chrome_bin }} --no-first-run --no-default-browser-check "{{ url }}" >/tmp/open-browser.log 2>&1 &
+        sleep 3
+      async: 30
+      poll: 0
+      ignore_errors: true
+      when: action == "open"
