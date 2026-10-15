@@ -1,0 +1,150 @@
+---
+# Смена обоев рабочего стола и/или экрана блокировки
+# Persistent через overlayroot-chroot (+ мгновенное применение в текущей сессии)
+#
+# Использование:
+#   ansible-playbook playbooks/wallpaper.yml -e "src=../files/new_wallpaper.png"
+#   ansible-playbook playbooks/wallpaper.yml -e "url=https://example.com/wallpaper.png"
+#   ansible-playbook playbooks/wallpaper.yml -e "src=../files/lock.png" -e "target=lock"
+#   ansible-playbook playbooks/wallpaper.yml -e "src=../files/desk.png" -e "target=desktop"
+
+- name: Change wallpaper
+  hosts: students
+  gather_facts: false
+  become: true
+
+  vars:
+    src: ""
+    url: ""
+    target: both    # both | desktop | lock
+
+    tmp_wallpaper: /tmp/new_wallpaper.png
+    tmp_dconf: /tmp/02-wallpaper.dconf
+    desktop_wallpaper: /usr/share/backgrounds/01/wallpaper.png
+    lock_wallpaper: /usr/share/backgrounds/gdm/gdm-wallpaper
+    dconf_file: /etc/dconf/db/local.d/02-wallpaper
+
+    wallpaper_files: >-
+      {{ ([desktop_wallpaper] if target in ['both', 'desktop'] else [])
+         + ([lock_wallpaper] if target in ['both', 'lock'] else []) }}
+
+  tasks:
+    - name: Validate input
+      ansible.builtin.assert:
+        that:
+          - target in ['both', 'desktop', 'lock']
+          - (src | length > 0) or (url | length > 0)
+        fail_msg: "Укажите src=... или url=..., а target должен быть both | desktop | lock"
+      run_once: true
+
+    - name: Copy wallpaper from admin machine
+      ansible.builtin.copy:
+        src: "{{ src }}"
+        dest: "{{ tmp_wallpaper }}"
+        mode: '0644'
+      when: src | length > 0
+
+    - name: Download wallpaper from URL
+      ansible.builtin.get_url:
+        url: "{{ url }}"
+        dest: "{{ tmp_wallpaper }}"
+        mode: '0644'
+        force: true
+      when: (url | length > 0) and (src | length == 0)
+
+    - name: Get checksum of the uploaded wallpaper
+      ansible.builtin.stat:
+        path: "{{ tmp_wallpaper }}"
+        checksum_algorithm: sha256
+      register: wp_stat
+
+    # ---------- Persistent (нижний слой) ----------
+    # Файл передаётся через stdin, т.к. /tmp хоста не виден внутри chroot
+    - name: Install wallpaper into persistent layer
+      ansible.builtin.shell: |
+        overlayroot-chroot sh -c 'set -e; mkdir -p "$(dirname {{ item }})"; cat > {{ item }}; chmod 644 {{ item }}' < {{ tmp_wallpaper }}
+      args:
+        executable: /bin/bash
+      loop: "{{ wallpaper_files }}"
+      changed_when: true
+
+    - name: Verify wallpaper in persistent layer
+      ansible.builtin.shell: |
+        set -o pipefail
+        overlayroot-chroot sha256sum {{ item }} | grep -o '^[0-9a-f]\{64\}'
+      args:
+        executable: /bin/bash
+      loop: "{{ wallpaper_files }}"
+      register: lower_sums
+      changed_when: false
+      failed_when: lower_sums.stdout != wp_stat.stat.checksum
+
+    # ---------- Live (текущая сессия) ----------
+    - name: Ensure wallpaper directories exist (live)
+      ansible.builtin.file:
+        path: "{{ item | dirname }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ wallpaper_files }}"
+
+    - name: Install wallpaper (live)
+      ansible.builtin.copy:
+        src: "{{ tmp_wallpaper }}"
+        dest: "{{ item }}"
+        remote_src: true
+        mode: '0644'
+      loop: "{{ wallpaper_files }}"
+
+    # ---------- dconf ----------
+    - name: Prepare dconf settings
+      ansible.builtin.copy:
+        dest: "{{ tmp_dconf }}"
+        mode: '0644'
+        content: |
+          {% if target in ['both', 'desktop'] %}
+          [org/gnome/desktop/background]
+          picture-uri='file://{{ desktop_wallpaper }}'
+          picture-uri-dark='file://{{ desktop_wallpaper }}'
+          picture-options='zoom'
+
+          {% endif %}
+          {% if target in ['both', 'lock'] %}
+          [org/gnome/desktop/screensaver]
+          picture-uri='file://{{ lock_wallpaper }}'
+          picture-options='zoom'
+          {% endif %}
+
+    - name: Apply dconf settings in persistent layer
+      ansible.builtin.shell: |
+        overlayroot-chroot sh -c '
+          set -e
+          mkdir -p /etc/dconf/db/local.d /etc/dconf/profile
+          cat > {{ dconf_file }}
+          grep -qs "^system-db:local" /etc/dconf/profile/user || {
+            [ -s /etc/dconf/profile/user ] || echo "user-db:user" > /etc/dconf/profile/user
+            echo "system-db:local" >> /etc/dconf/profile/user
+          }
+          dconf update
+        ' < {{ tmp_dconf }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Apply dconf settings (live)
+      ansible.builtin.shell: |
+        set -e
+        mkdir -p /etc/dconf/db/local.d
+        cp {{ tmp_dconf }} {{ dconf_file }}
+        chmod 644 {{ dconf_file }}
+        dconf update
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Cleanup temp files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ tmp_wallpaper }}"
+        - "{{ tmp_dconf }}"
